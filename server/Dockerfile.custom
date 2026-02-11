@@ -1,0 +1,111 @@
+# Dockerfile for Mattermost with Custom OpenID Support
+# Multi-stage build for optimized image size
+# Build from repository root: docker buildx build --platform linux/amd64 -f server/Dockerfile.custom -t image:tag .
+
+# Stage 1: Build Server
+FROM golang:1.25-alpine AS server-builder
+
+# Install build dependencies
+RUN apk add --no-cache git make ca-certificates tzdata
+
+WORKDIR /build/server
+
+# Copy go mod files first for better caching
+COPY server/go.mod server/go.sum ./
+COPY server/public/go.mod server/public/go.sum ./public/
+
+# Download dependencies
+RUN go mod download
+
+# Copy the server source code
+COPY server/ .
+
+# Build the Mattermost server with custom OpenID provider
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -a -installsuffix cgo \
+    -ldflags '-X "github.com/mattermost/mattermost/server/public/model.BuildNumber=custom-openid" \
+              -X "github.com/mattermost/mattermost/server/public/model.BuildDate='$(date -u +%Y-%m-%d)'" \
+              -X "github.com/mattermost/mattermost/server/public/model.BuildHash='$(git rev-parse HEAD 2>/dev/null || echo "dev")'" \
+              -X "github.com/mattermost/mattermost/server/public/model.BuildHashEnterprise=none" \
+              -X "github.com/mattermost/mattermost/server/public/model.BuildEnterpriseReady=false" \
+              -w -s' \
+    -o /mattermost/bin/mattermost ./cmd/mattermost
+
+# Stage 2: Build Webapp
+FROM node:20-alpine AS webapp-builder
+
+# Install build dependencies for native modules
+RUN apk add --no-cache \
+    python3 \
+    make \
+    g++ \
+    gcc \
+    autoconf \
+    automake \
+    libtool \
+    nasm \
+    libpng-dev \
+    pkgconfig
+
+WORKDIR /build/webapp
+
+# Copy webapp source code (including all package.json files for workspaces)
+COPY webapp/ .
+
+# Install dependencies (with specific env for optipng issues on different architectures)
+ENV CPPFLAGS="-DPNG_ARM_NEON_OPT=0"
+RUN npm ci --include=dev
+
+# Build the webapp
+RUN npm run build
+
+# Stage 3: Runtime
+FROM alpine:3.19
+
+# Install runtime dependencies
+RUN apk add --no-cache \
+    ca-certificates \
+    curl \
+    libc6-compat \
+    libffi \
+    linux-headers \
+    mailcap \
+    netcat-openbsd \
+    xmlsec \
+    tzdata \
+    && rm -rf /tmp/*
+
+# Create mattermost user and group
+RUN addgroup -g 2000 mattermost && \
+    adduser -D -u 2000 -G mattermost -h /mattermost -s /bin/sh mattermost
+
+# Set working directory
+WORKDIR /mattermost
+
+# Copy built server binary from server-builder
+COPY --from=server-builder --chown=mattermost:mattermost /mattermost/bin/mattermost /mattermost/bin/
+
+# Copy server support files from server-builder
+COPY --from=server-builder --chown=mattermost:mattermost /build/server/i18n /mattermost/i18n
+COPY --from=server-builder --chown=mattermost:mattermost /build/server/fonts /mattermost/fonts
+COPY --from=server-builder --chown=mattermost:mattermost /build/server/templates /mattermost/templates
+
+# Copy built webapp client from webapp-builder
+COPY --from=webapp-builder --chown=mattermost:mattermost /build/webapp/channels/dist /mattermost/client
+
+# Create necessary directories
+RUN mkdir -p /mattermost/data /mattermost/logs /mattermost/config /mattermost/plugins /mattermost/client/plugins && \
+    chown -R mattermost:mattermost /mattermost
+
+# Switch to mattermost user
+USER mattermost
+
+# Expose ports
+EXPOSE 8065 8067
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8065/api/v4/system/ping || exit 1
+
+# Set entrypoint
+ENTRYPOINT ["/mattermost/bin/mattermost"]
